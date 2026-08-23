@@ -104,6 +104,38 @@ def test_classify_server_unreachable():
     assert any(i["error_type"] == "server_unreachable" for i in incidents)
 
 
+def test_classify_single_incident_when_models_fail():
+    """Audit P1: server unreachable must yield exactly ONE incident (no
+    duplicate generation_error / low_throughput from a skipped probe)."""
+    checks = {
+        "checks": {
+            "models": {"ok": False, "error": "[Errno 10061] connection refused", "count": 0, "ids": []},
+            "slot": {"ok": False, "status": "not_checked", "note": "server_unreachable"},
+            "generation": {"tok_s": 0, "latency_s": 0.0, "completion_tokens": 0, "skipped": "server_unreachable"},
+        }
+    }
+    incidents = monitor.classify_incident(checks)
+    assert len(incidents) == 1, f"expected single incident, got: {incidents}"
+    assert incidents[0]["error_type"] == "server_unreachable"
+    assert incidents[0]["severity"] == "critical"
+
+
+def test_check_server_skips_all_probes_when_models_fail():
+    """Audit P1: when /v1/models fails, neither /health nor the generation
+    probe may run — no GEN_TIMEOUT wait, no duplicate incidents."""
+    calls = []
+
+    def side_effect(path, body=None, timeout=120):
+        calls.append(path)
+        return {"error": "[Errno 10061] connection refused"}
+
+    with patch.object(monitor, "api", side_effect=side_effect):
+        result = monitor.check_server()
+    assert result["checks"]["models"]["ok"] is False
+    assert result["checks"]["generation"].get("skipped") == "server_unreachable"
+    assert calls == ["/models"], f"only /models must be called, got: {calls}"
+
+
 def test_classify_server_busy_warning():
     """Busy slot → server_busy warning, NOT critical generation_error."""
     checks = {
@@ -254,6 +286,7 @@ def test_measure_with_text_fallback():
             result = monitor.measure_tok_s(100)
         assert result.get("completion_tokens", 0) > 0, f"should estimate tokens: {result}"
         assert result["tok_s"] > 0
+        assert result.get("estimated") is True, "text-length fallback must be flagged as estimated"
 
 
 def test_api_http_error_status():

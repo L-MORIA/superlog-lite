@@ -117,7 +117,7 @@ NO INCIDENTS — server healthy
 | `SUPERLOG_BASE` | — | `http://localhost:8083/v1` | Адрес API сервера |
 | `SUPERLOG_TOK_S_THRESHOLD` | `--threshold-tok` | `10` | Порог tok/s для `low_throughput` |
 | `SUPERLOG_LATENCY_THRESHOLD` | `--threshold-latency` | `30` | Порог секунд для `high_latency` |
-| `SUPERLOG_RESTART_COOLDOWN` | — | `600` | Cooldown между рестартами, c |
+| `SUPERLOG_RESTART_COOLDOWN` | — | `600` | Cooldown между рестартами, c (см. ниже) |
 | `SUPERLOG_RESTART_BAT` | — | `<родитель>/barozp-opus-8083/run_barozp_8083_mtp.bat` | Скрипт рестарта |
 | `SUPERLOG_RESTART_CWD` | — | каталог `RESTART_BAT` | Рабочий каталог рестарта |
 
@@ -128,6 +128,21 @@ set SUPERLOG_BASE=http://localhost:8083/v1
 set SUPERLOG_TOK_S_THRESHOLD=20
 set SUPERLOG_RESTART_BAT=D:\servers\restart_llm.bat
 python monitor.py
+```
+
+### Периодический запуск и семантика cooldown
+
+`superlog-lite` — одноразовый запуск, а не демон: периодичность обеспечивает планировщик.
+
+**Важно про cooldown:** `RESTART_COOLDOWN_S` защищает **между** запусками процесса (состояние читается из БД), а не «внутри» одного прогона. Чтобы защита от шторма рестартов работала как задумано:
+
+- интервал Task Scheduler должен быть **меньше** `RESTART_COOLDOWN_S` (по умолчанию 600 с) — тогда повторный инцидент в течение cooldown приведёт к `skipped (cooldown)` вместо нового рестарта;
+- если запускать реже, чем раз в cooldown, каждый новый прогон при упавшем сервере будет рестартовать заново — это допустимо, но осознанный выбор.
+
+Пример задачи Windows (каждые 5 минут):
+
+```bat
+schtasks /Create /TN "SuperlogLite" /SC MINUTE /MO 5 /TR "python C:\path\to\superlog-lite\monitor.py"
 ```
 
 ## История инцидентов
@@ -154,7 +169,7 @@ python -m py_compile monitor.py demo_incident.py make_icon.py
 pytest tests -q
 ```
 
-Текущее состояние: **42 passed**, ruff — 0 ошибок.
+Текущее состояние: **44 passed**, ruff — 0 ошибок. CI (GitHub Actions: ruff + pytest, Ubuntu/Windows, Python 3.11–3.13) прогоняет то же самое на каждый push/PR.
 
 ## Структура проекта
 
@@ -164,7 +179,7 @@ pytest tests -q
 | `demo_incident.py` | Демо жизненного цикла в `demo_incidents.db` |
 | `make_icon.py` | Генерация `superlog_lite_icon.{png,ico}` |
 | `monitor_8083.bat` | Windows-лаунчер (`%~dp0`, без хардкода диска) |
-| `tests/` | 42 теста (классификация, fingerprint, БД, auto-fix, security-scan) |
+| `tests/` | 44 теста (классификация, fingerprint, БД, auto-fix, security-scan) |
 | `docs/USER_GUIDE.md` | Руководство пользователя |
 | `docs/AGENT_INSTRUCTIONS.md` | Инструкции для ИИ-агентов |
 | `docs/ARCHITECTURE.md` | Архитектура и схема данных |
@@ -174,9 +189,9 @@ pytest tests -q
 
 - Авто-фикс Windows-only (`cmd /c`, `CREATE_NEW_CONSOLE`); на Linux вернёт `failed`
 - Нет веб-интерфейса — только CLI + SQLite
-- `usage.completion_tokens==0` → оценка токенов по длине текста (`len // 4`)
+- `usage.completion_tokens==0` → оценка токенов по длине текста (`len // 4`); такие результаты помечаются флагом `estimated: true`
 - `/models` используется вместо `/health` (у ik_llama.cpp нет `/v1/health`)
 
 ## Лицензия
 
-Личное использование. См. профиль [L-MORIA](https://github.com/L-MORIA).
+[MIT](LICENSE)

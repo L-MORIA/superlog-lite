@@ -144,9 +144,13 @@ def fingerprint(error_type: str, top_frame: str = "") -> str:
     return hashlib.sha256(sig.encode()).hexdigest()[:16]
 
 
-def init_db():
-    """Initialize SQLite incident memory (WAL, timeout)."""
-    with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
+def init_db(db_path=None):
+    """Initialize SQLite incident memory (WAL, timeout).
+
+    db_path defaults to DB_PATH resolved at call time; demo_incident.py
+    passes its own demo DB path here.
+    """
+    with sqlite3.connect(db_path or DB_PATH, timeout=5.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute(_CREATE_INCIDENTS_DDL)
         conn.execute(_CREATE_AGENT_RUNS_DDL)
@@ -188,6 +192,7 @@ def measure_tok_s(max_tokens=100, timeout=None):
 
     usage = r.get("usage", {})
     comp_tokens = usage.get("completion_tokens", 0)
+    estimated = False
 
     # If server didn't return usage, try to estimate from text length or mark as error
     if comp_tokens == 0:
@@ -199,6 +204,7 @@ def measure_tok_s(max_tokens=100, timeout=None):
                 # Rough estimate: 1 token ~ 4 chars for Russian/English mix
                 est = max(1, len(text) // 4)
                 comp_tokens = est
+                estimated = True
             else:
                 return {"error": "no completion_tokens in response", "tok_s": 0, "latency_s": t1 - t0}
         else:
@@ -209,13 +215,17 @@ def measure_tok_s(max_tokens=100, timeout=None):
         gen_s = 0.001
     tok_s = comp_tokens / gen_s if gen_s > 0 else 0
 
-    return {
+    result = {
         "tok_s": tok_s,
         "latency_s": gen_s,
         "completion_tokens": comp_tokens,
         "model": model,
         "ok": True,
     }
+    if estimated:
+        # Flag heuristic results so downstream findings can mark them approximate
+        result["estimated"] = True
+    return result
 
 
 def _server_root() -> str:
@@ -242,6 +252,17 @@ def check_server():
         result["checks"]["models"]["error"] = models["error"]
         if "status" in models:
             result["checks"]["models"]["status"] = models["status"]
+        # Server is unreachable at the API root: probing /health and running
+        # the generation test would only add up to GEN_TIMEOUT of waiting and
+        # produce a duplicate generation_error next to server_unreachable.
+        result["checks"]["slot"] = {"ok": False, "status": "not_checked", "note": "server_unreachable"}
+        result["checks"]["generation"] = {
+            "tok_s": 0,
+            "latency_s": 0.0,
+            "completion_tokens": 0,
+            "skipped": "server_unreachable",
+        }
+        return result
 
     # Check 1b: /health slot availability (server root, not /v1). With
     # --parallel 1 a busy slot makes the generation probe block up to
@@ -281,15 +302,17 @@ def classify_incident(checks):
 
     models_check = checks["checks"]["models"]
     if not models_check["ok"]:
+        # Root cause: server unreachable. Degradation checks are meaningless
+        # without a reachable API — report only the root incident.
         fp = fingerprint("server_unreachable", models_check.get("error", ""))
-        incidents.append(
+        return [
             {
                 "fingerprint": fp,
                 "error_type": "server_unreachable",
                 "severity": "critical",
                 "message": "Server not responding",
             }
-        )
+        ]
 
     gen = checks["checks"]["generation"]
     slot = checks["checks"].get("slot")
@@ -343,13 +366,17 @@ def classify_incident(checks):
     return incidents
 
 
-def store_incident(incident):
-    """Store incident in SQLite memory (Superlog pattern) — handles race via ON CONFLICT."""
+def store_incident(incident, db_path=None):
+    """Store incident in SQLite memory (Superlog pattern) — handles race via ON CONFLICT.
+
+    db_path defaults to DB_PATH resolved at call time (so tests/CLI can patch it).
+    demo_incident.py reuses this function with its own demo DB.
+    """
     fp = incident["fingerprint"]
     now = now_iso()
     findings_init = INITIAL_FINDINGS_TEMPLATE.format(error_type=incident["error_type"])
 
-    with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
+    with sqlite3.connect(db_path or DB_PATH, timeout=5.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
 
         # Try to insert, on conflict do update
@@ -385,6 +412,7 @@ def store_incident(incident):
         conn.commit()
 
     return {
+        "fingerprint": fp,
         "is_recurrence": is_recurrence,
         "prior_findings": prior_findings,
         "run_count": run_count,

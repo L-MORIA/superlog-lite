@@ -2,27 +2,26 @@
 Demo: Simulate incidents to show Superlog-lite pattern in action.
 - Run 1: Detect new incident → store in memory
 - Run 2: Detect same incident → recurrence, load prior findings
-Uses monitor.fingerprint/init_db for single source of truth; demo writes to separate demo_incidents.db
-to avoid polluting incidents.db.
+Uses monitor.fingerprint/init_db/store_incident as single source of truth;
+demo writes to separate demo_incidents.db to avoid polluting incidents.db.
 """
 
 import argparse
-import json
 import os
 import sqlite3
 from pathlib import Path
 
 from monitor import (
-    _CREATE_AGENT_RUNS_DDL,
-    _CREATE_INCIDENTS_DDL,
-    INITIAL_FINDINGS_TEMPLATE,
-    fingerprint,
-    now_iso,
-)
-
-# Reuse single source of truth from monitor.py
-from monitor import (
     DB_PATH as MONITOR_DB_PATH,
+)
+from monitor import (
+    fingerprint,
+)
+from monitor import (
+    init_db as _monitor_init_db,
+)
+from monitor import (
+    store_incident as _monitor_store_incident,
 )
 
 # Demo uses separate DB by default (avoid polluting real incidents)
@@ -30,67 +29,21 @@ DEMO_DB_PATH = Path(__file__).parent / "demo_incidents.db"
 
 
 def init_db(db_path=DEMO_DB_PATH):
-    """Initialize demo SQLite DB — uses monitor.py DDL as single source of truth."""
-    with sqlite3.connect(db_path, timeout=5.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute(_CREATE_INCIDENTS_DDL)
-        conn.execute(_CREATE_AGENT_RUNS_DDL)
-        conn.commit()
+    """Initialize demo SQLite DB — delegates to monitor.init_db (single source of truth)."""
+    _monitor_init_db(db_path)
 
 
 def store_incident(error_type: str, message: str, severity: str = "warning", db_path=DEMO_DB_PATH):
-    """Store incident + log agent run (Superlog pattern) — single INSERT, no double UPDATE."""
-    fp = fingerprint(error_type, message)
-    now = now_iso()
-
-    with sqlite3.connect(db_path, timeout=5.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        row = conn.execute(
-            "SELECT run_count, findings FROM incidents WHERE fingerprint=?", (fp,)
-        ).fetchone()
-
-        if row:
-            # Recurrence
-            conn.execute(
-                "UPDATE incidents SET last_seen=?, run_count=run_count+1 WHERE fingerprint=?",
-                (now, fp),
-            )
-            is_recurrence = True
-            prior_findings = row[1]
-            run_count = row[0] + 1
-        else:
-            # New incident — single INSERT
-            findings_init = INITIAL_FINDINGS_TEMPLATE.format(error_type=error_type)
-            conn.execute(
-                "INSERT INTO incidents (id, fingerprint, error_type, top_frame, first_seen, last_seen, run_count, findings, resolution) "
-                "VALUES (?, ?, ?, ?, ?, ?, 1, ?, NULL)",
-                (fp, fp, error_type, message, now, now, findings_init),
-            )
-            is_recurrence = False
-            prior_findings = None
-            run_count = 1
-
-        ended = now_iso()
-        conn.execute(
-            "INSERT INTO agent_runs (incident_id, started_at, ended_at, status, actions_json) VALUES (?, ?, ?, 'completed', ?)",
-            (
-                fp,
-                now,
-                ended,
-                json.dumps(
-                    {"action": "monitored", "error_type": error_type, "message": message, "severity": severity},
-                    ensure_ascii=False,
-                ),
-            ),
-        )
-        conn.commit()
-
-    return {
-        "fingerprint": fp,
-        "is_recurrence": is_recurrence,
-        "run_count": run_count,
-        "prior_findings": prior_findings,
-    }
+    """Store incident + log agent run — delegates to monitor.store_incident."""
+    return _monitor_store_incident(
+        {
+            "fingerprint": fingerprint(error_type, message),
+            "error_type": error_type,
+            "message": message,
+            "severity": severity,
+        },
+        db_path=db_path,
+    )
 
 
 def show_memory(db_path=DEMO_DB_PATH):
