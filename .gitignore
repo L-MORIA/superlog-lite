@@ -1,0 +1,38 @@
+# SQLite
+incidents.db
+incidents.db-wal
+incidents.db-shm
+demo_incidents.db
+demo_incidents.db-wal
+demo_incidents.db-shm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+.last_restart
+
+# Backups (не коммитить)
+*.bak_*
+*.tmp
+
+# Icons — keep sources but ignore generated if needed (comment out to track)
+# superlog_lite_icon.png
+# superlog_lite_icon.ico
+
+# Env
+.env
+
+# Test/demo DBs anywhere
+tests/*.db
+**/*.db

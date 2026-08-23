@@ -1,0 +1,50 @@
+[project]
+name = "superlog-lite"
+version = "0.1.0"
+description = "Lightweight monitoring watchdog for local LLM servers (superlog-lite)"
+requires-python = ">=3.11"
+
+[tool.ruff]
+# Project uses 120-char line length as a pragmatic compromise:
+# most E501 violations were long log strings / SQL / shell-style continued args
+# which read better on one line at 120 than wrapped awkwardly at 88.
+line-length = 120
+target-version = "py311"
+extend-exclude = ["**/*.bak_*", "**/__pycache__", "audit", "docs"]
+
+[tool.ruff.lint]
+# Default-enable E/F/W + the categories we're cleaning in P3.
+# Hard-deferred (need design decisions): ANN (type hints), C901 (refactor),
+# PLR0911/0915 (refactor), PLC0415 (import location - test fixtures are legit).
+select = ["E", "W", "F", "I", "B", "SIM", "PLW", "RUF", "S", "T", "PLR", "ARG", "N", "TRY", "PT", "PTH", "ERA", "RET", "YTT", "BLE", "PIE"]
+ignore = [
+    "E501",   # handled by line-length = 120 (we don't wrap, we allow up to 120)
+    "S101",   # `assert` is the standard pytest idiom; we use it on purpose
+    "T201",   # demo_incident.py is a demo: print() is the user-visible output
+    "PLR2004",# magic numbers are domain-meaningful (tok_s thresholds, timeouts)
+    "ANN",    # deferred P4 - adding type hints to all 49+23 spots is a separate pass
+    "D",      # no docstring enforcement - project is a watchdog, not a library
+    "PLR0911","PLR0912","PLR0913","PLR0915",  # too-many-* deferred to refactor pass
+    "C901",   # complexity deferred to refactor pass
+    "COM812", "ISC001",  # conflict with formatter
+    "TRY003", # long messages in except are fine here
+    "EM101","EM102",  # exception-stringify - we already log via logger.debug
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately use assert, magic numbers, subprocess without check
+"tests/**/*.py" = [
+    "S101",    # pytest assert idiom
+    "PLR2004", # test thresholds
+    "S603",    # subprocess in tests is fine when we mock args
+    "S607",    # same
+    "ARG",     # fixtures may have unused args
+    "PTH",     # tests use Path() a lot
+    "PT018",   # composite asserts are intentional - one logical invariant per test
+]
+# demo_incident.py is user-facing demo
+"demo_incident.py" = ["T201"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

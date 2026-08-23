@@ -1,0 +1,5 @@
+Pillow>=10.0
+# stdlib only for monitor.py: sqlite3, urllib, hashlib, json, argparse
+# test only:
+pytest>=8.0
+ruff>=0.8
