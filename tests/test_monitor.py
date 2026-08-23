@@ -9,6 +9,17 @@ sys.path.insert(0, str(PROJECT))
 import monitor  # noqa: E402
 
 
+def _concurrent_worker(db_path_str: str, fp: str, writes: int) -> None:
+    """Spawn-process entry point: re-import monitor and write to the shared DB."""
+    sys.path.insert(0, str(PROJECT))
+    import monitor as m
+
+    m.DB_PATH = Path(db_path_str)
+    inc = {"fingerprint": fp, "error_type": "low_throughput", "message": "degraded", "severity": "warning"}
+    for _ in range(writes):
+        m.store_incident(inc)
+
+
 def test_fingerprint_bucketing_low_throughput():
     """C-02: 8.2 vs 8.3 should give SAME fingerprint (bucketed)."""
     fp1 = monitor.fingerprint("low_throughput", "tok_s=8.2")
@@ -249,6 +260,36 @@ def test_store_incident_no_double_timestamp(tmp_path):
         with sqlite3.connect(db, timeout=5.0) as conn:
             first, last = conn.execute("SELECT first_seen, last_seen FROM incidents WHERE fingerprint=?", (inc["fingerprint"],)).fetchone()
             assert first == last, f"first {first} != last {last} — two datetime.now() bug"
+
+
+def test_store_incident_concurrent_processes_no_lost_updates(tmp_path):
+    """Audit follow-up: parallel processes writing the SAME fingerprint must not
+    lose updates — INSERT + IntegrityError + UPDATE keeps run_count exact."""
+    import multiprocessing as mp
+
+    db = tmp_path / "race.db"
+    with patch.object(monitor, "DB_PATH", db):
+        monitor.init_db()
+    fp = monitor.fingerprint("low_throughput", "")
+    workers, writes = 4, 5
+
+    ctx = mp.get_context("spawn")  # same semantics on Linux CI and Windows
+    procs = [ctx.Process(target=_concurrent_worker, args=(str(db), fp, writes)) for _ in range(workers)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(120)
+    assert all(p.exitcode == 0 for p in procs), f"worker crashed: {[p.exitcode for p in procs]}"
+
+    with sqlite3.connect(db, timeout=5.0) as conn:
+        cnt, run_count = conn.execute(
+            "SELECT count(*), sum(run_count) FROM incidents WHERE fingerprint=?", (fp,)
+        ).fetchone()
+        runs = conn.execute("SELECT count(*) FROM agent_runs").fetchone()[0]
+
+    assert cnt == 1, f"fingerprint must be a single row, got {cnt}"
+    assert run_count == workers * writes, f"lost updates: {run_count} != {workers * writes}"
+    assert runs == workers * writes, f"agent_runs lost: {runs} != {workers * writes}"
 
 
 def test_init_db_wal(tmp_path):

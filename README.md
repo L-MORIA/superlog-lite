@@ -169,7 +169,7 @@ python -m py_compile monitor.py demo_incident.py make_icon.py
 pytest tests -q
 ```
 
-Текущее состояние: **44 passed**, ruff — 0 ошибок. CI (GitHub Actions: ruff + pytest, Ubuntu/Windows, Python 3.11–3.13) прогоняет то же самое на каждый push/PR.
+Текущее состояние: **45 passed**, ruff — 0 ошибок. CI (GitHub Actions: ruff + pytest, Ubuntu/Windows, Python 3.11–3.13) прогоняет то же самое на каждый push/PR.
 
 ## Структура проекта
 
@@ -179,7 +179,7 @@ pytest tests -q
 | `demo_incident.py` | Демо жизненного цикла в `demo_incidents.db` |
 | `make_icon.py` | Генерация `superlog_lite_icon.{png,ico}` |
 | `monitor_8083.bat` | Windows-лаунчер (`%~dp0`, без хардкода диска) |
-| `tests/` | 44 теста (классификация, fingerprint, БД, auto-fix, security-scan) |
+| `tests/` | 45 тестов (классификация, fingerprint, БД + конкурентная запись из процессов, auto-fix, security-scan) |
 | `docs/USER_GUIDE.md` | Руководство пользователя |
 | `docs/AGENT_INSTRUCTIONS.md` | Инструкции для ИИ-агентов |
 | `docs/ARCHITECTURE.md` | Архитектура и схема данных |
