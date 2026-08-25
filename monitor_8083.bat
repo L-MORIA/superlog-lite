@@ -1,21 +1,20 @@
 @echo off
-chcp 65001 >nul
-title Superlog-lite: мониторинг ik_llama:8083 (auto-fix)
+title Superlog-lite: monitoring ik_llama:8083 (auto-fix)
 setlocal
 
 echo ============================================================
-echo  SUPERLOG-LITE: мониторинг ik_llama:8083
+echo  SUPERLOG-LITE: monitoring ik_llama:8083
 echo  %~dp0monitor.py
-echo  - проверка /v1/models + генерация
-echo  - инциденты в SQLite (incidents.db)
-echo  - auto-fix: перезапуск сервера при падении (cooldown 600s)
+echo  - checks /v1/models + trial generation
+echo  - incidents stored in SQLite (incidents.db)
+echo  - auto-fix: server restart on crash (cooldown 600s)
 echo ============================================================
 
 cd /d "%~dp0"
 
 where python >nul 2>&1
 if errorlevel 1 (
-  echo [error] python не найден в PATH. Установите Python 3.11+
+  echo [error] python not found in PATH. Install Python 3.11+
   pause
   exit /b 1
 )
@@ -23,12 +22,12 @@ if errorlevel 1 (
 python monitor.py %*
 
 if errorlevel 1 (
-  echo [warn] monitor.py завершился с кодом %errorlevel%
+  echo [warn] monitor.py exited with code %errorlevel%
 )
 
 echo.
 echo ============================================================
-echo  Готово. Память инцидентов: %~dp0incidents.db
-echo  Для справки: python monitor.py --help
+echo  Done. Incident memory: %~dp0incidents.db
+echo  For help: python monitor.py --help
 echo ============================================================
 pause
