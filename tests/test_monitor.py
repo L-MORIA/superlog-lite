@@ -3,17 +3,33 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 PROJECT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT))
-
 import monitor  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+
+
+def _never_touch_real_bats(tmp_path, monkeypatch):
+    """SAFETY: in tests auto_fix must never reach a real production bat.
+    Guards against regressions where code reads PORT_RESTART_BATS but a test
+    only patches the legacy RESTART_BAT (real incident: a test spawned the
+    actual barozp restart bat and killed live servers).
+    """
+    fake = tmp_path / "fake_restart.bat"
+    fake.write_bytes(b"echo fake")
+    monkeypatch.setattr(monitor, "PORT_RESTART_BATS", {8083: str(fake), 8080: str(fake)})
+    monkeypatch.setattr(monitor, "RESTART_BAT", str(fake))
+    monkeypatch.setattr(monitor, "_CREATE_NEW_CONSOLE", 0)
 
 
 def _concurrent_worker(db_path_str: str, fp: str, writes: int) -> None:
     """Spawn-process entry point: re-import monitor and write to the shared DB."""
     sys.path.insert(0, str(PROJECT))
     import monitor as m
-
     m.DB_PATH = Path(db_path_str)
     inc = {"fingerprint": fp, "error_type": "low_throughput", "message": "degraded", "severity": "warning"}
     for _ in range(writes):
@@ -135,11 +151,9 @@ def test_check_server_skips_all_probes_when_models_fail():
     """Audit P1: when /v1/models fails, neither /health nor the generation
     probe may run — no GEN_TIMEOUT wait, no duplicate incidents."""
     calls = []
-
     def side_effect(path, body=None, timeout=120, base=None):
         calls.append(path)
         return {"error": "[Errno 10061] connection refused"}
-
     with patch.object(monitor, "api", side_effect=side_effect):
         result = monitor.check_server()
     assert result["checks"]["models"]["ok"] is False
@@ -183,7 +197,6 @@ def test_fingerprint_server_busy_stable():
 def test_check_server_skips_probe_when_slot_busy():
     """When /health says no slot available, the generation probe must not run."""
     calls = []
-
     def side_effect(path, body=None, timeout=120, base=None):
         calls.append(path)
         if path.endswith("/models"):
@@ -191,7 +204,6 @@ def test_check_server_skips_probe_when_slot_busy():
         if path.endswith("/health"):
             return {"status": "no slot available", "slots_idle": 0, "slots_processing": 1}
         return {}
-
     with patch.object(monitor, "api", side_effect=side_effect):
         result = monitor.check_server()
     assert result["checks"]["slot"]["ok"] is False
@@ -207,7 +219,6 @@ def test_check_server_slot_ok_runs_probe():
         if path.endswith("/health"):
             return {"status": "ok"}
         return {"choices": [], "usage": {}}
-
     with patch.object(monitor, "api", side_effect=side_effect):
         result = monitor.check_server()
     assert result["checks"]["slot"]["ok"] is True
@@ -216,13 +227,11 @@ def test_check_server_slot_ok_runs_probe():
 
 def test_measure_gen_timeout_passthrough():
     captured = {}
-
     def side_effect(path, body=None, timeout=120, base=None):
         captured[path] = timeout
         if path == "/models":
             return {"data": [{"id": "m"}]}
         return {"choices": [{"message": {"content": "hello"}}], "usage": {"completion_tokens": 3}}
-
     with patch.object(monitor, "api", side_effect=side_effect):
         monitor.measure_tok_s(10)
         assert captured["/chat/completions"] == monitor.GEN_TIMEOUT
@@ -266,13 +275,11 @@ def test_store_incident_concurrent_processes_no_lost_updates(tmp_path):
     """Audit follow-up: parallel processes writing the SAME fingerprint must not
     lose updates — INSERT + IntegrityError + UPDATE keeps run_count exact."""
     import multiprocessing as mp
-
     db = tmp_path / "race.db"
     with patch.object(monitor, "DB_PATH", db):
         monitor.init_db()
     fp = monitor.fingerprint("low_throughput", "")
     workers, writes = 4, 5
-
     ctx = mp.get_context("spawn")  # same semantics on Linux CI and Windows
     procs = [ctx.Process(target=_concurrent_worker, args=(str(db), fp, writes)) for _ in range(workers)]
     for p in procs:
@@ -280,13 +287,11 @@ def test_store_incident_concurrent_processes_no_lost_updates(tmp_path):
     for p in procs:
         p.join(120)
     assert all(p.exitcode == 0 for p in procs), f"worker crashed: {[p.exitcode for p in procs]}"
-
     with sqlite3.connect(db, timeout=5.0) as conn:
         cnt, run_count = conn.execute(
             "SELECT count(*), sum(run_count) FROM incidents WHERE fingerprint=?", (fp,)
         ).fetchone()
         runs = conn.execute("SELECT count(*) FROM agent_runs").fetchone()[0]
-
     assert cnt == 1, f"fingerprint must be a single row, got {cnt}"
     assert run_count == workers * writes, f"lost updates: {run_count} != {workers * writes}"
     assert runs == workers * writes, f"agent_runs lost: {runs} != {workers * writes}"
@@ -409,19 +414,53 @@ def test_auto_fix_cmd_c_for_bat(tmp_path):
             assert cmd[:2] == [r"C:\Windows\System32\cmd.exe", "/c"]
 
 
-def test_auto_fix_cooldown(tmp_path):
+def test_auto_fix_cooldown_counts_from_last_attempt(tmp_path):
+    """Cooldown measures from last ACTUAL restart attempt, not incident last_seen.
+
+    Regression guard: store_incident refreshes last_seen on every monitoring
+    run, so a persistent incident would block restart forever (elapsed=0).
+    """
     db = tmp_path / "cooldown.db"
     with patch.object(monitor, "DB_PATH", db):
         monitor.init_db()
         fp = monitor.fingerprint("server_unreachable", "err")
         inc = {"fingerprint": fp, "error_type": "server_unreachable", "severity": "critical", "message": "down"}
         monitor.store_incident(inc)
+        monitor.store_incident(inc)  # recurrence bumps run_count AND last_seen
+        # Simulate a restart attempt made right now
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "INSERT INTO agent_runs (incident_id, started_at, ended_at, status, actions_json) VALUES (?, ?, ?, ?, ?)",
+                (fp, now, now, "restart_attempted", "{}"),
+            )
+            conn.commit()
+        res = monitor.auto_fix(inc)
+        assert res["action"] == "skipped" and "cooldown" in res["reason"]
+
+
+def test_auto_fix_proceeds_when_no_prior_attempts(tmp_path):
+    """Fresh critical incident (no restart history) must actually restart."""
+    db = tmp_path / "fresh.db"
+    with patch.object(monitor, "DB_PATH", db):
+        monitor.init_db()
+        fp = monitor.fingerprint("server_unreachable", "err3")
+        inc = {"fingerprint": fp, "error_type": "server_unreachable", "severity": "critical", "message": "down"}
         monitor.store_incident(inc)
-        with patch.object(monitor, "RESTART_BAT", str(tmp_path / "fake.bat")), \
-             patch.object(monitor, "RESTART_CWD", str(tmp_path)), \
-             patch("pathlib.Path.exists", return_value=True):
+        with patch("subprocess.Popen") as mock_popen, \
+             patch.object(monitor, "api", return_value={"data": []}), \
+             patch("time.sleep", return_value=None):
+            mock_popen.return_value.pid = 777
             res = monitor.auto_fix(inc)
-            assert res["action"] == "skipped" and "cooldown" in res["reason"]
+        assert res["action"] == "restarted", res
+        # attempt must be recorded for future cooldown checks
+        with sqlite3.connect(db) as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM agent_runs WHERE incident_id=? AND status='restart_attempted'", (fp,)
+            ).fetchone()[0]
+        assert n == 1
 
 
 def test_monitor_help():
@@ -464,6 +503,7 @@ def test_ruff_clean():
 
 # --- Multi-port failover tests ---
 
+
 def test_db_for_port_primary_and_fallback():
     """Primary port keeps legacy incidents.db; fallback gets incidents_<port>.db."""
     assert monitor.db_for_port(8083, 8083) == monitor.DB_PATH
@@ -475,21 +515,16 @@ def test_db_for_port_primary_and_fallback():
 def test_api_base_param_overrides_base():
     """api(base=...) must target the given server, not module BASE."""
     captured = {}
-
     class FakeResp:
         def read(self):
             return b'{"data": []}'
-
         def __enter__(self):
             return self
-
         def __exit__(self, *a):
             return False
-
     def fake_urlopen(req, timeout=None):
         captured["url"] = req.full_url
         return FakeResp()
-
     with patch("urllib.request.urlopen", side_effect=fake_urlopen):
         monitor.api("/models", timeout=5, base="http://localhost:8080/v1")
     assert captured["url"].startswith("http://localhost:8080/v1"), captured["url"]
@@ -498,7 +533,6 @@ def test_api_base_param_overrides_base():
 def test_check_server_passes_base():
     """check_server(base=...) probes the given base (models + health)."""
     seen = []
-
     def side_effect(path, body=None, timeout=120, base=None):
         seen.append((path, base))
         if path.endswith("/models"):
@@ -506,7 +540,6 @@ def test_check_server_passes_base():
         if path.endswith("/health"):
             return {"status": "ok"}
         return {"choices": [{"message": {"content": "x" * 40}}], "usage": {"completion_tokens": 10}}
-
     with patch.object(monitor, "api", side_effect=side_effect):
         result = monitor.check_server(base="http://localhost:8080/v1")
     assert result["checks"]["models"]["ok"] is True

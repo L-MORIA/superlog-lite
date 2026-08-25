@@ -457,26 +457,42 @@ def auto_fix(incident, port=None, db_path=None):
     target_bat = PORT_RESTART_BATS.get(port or 8083, RESTART_BAT)
     cooldown_db = db_path or DB_PATH
 
-    # Cooldown: avoid restart storm — check last_seen for this fingerprint
+    # Cooldown: avoid restart storm. Measure from the last ACTUAL restart
+    # attempt (agent_runs.status='restart_attempted'), NOT from the incident's
+    # last_seen — store_incident refreshes last_seen on every monitoring run,
+    # so a persistent incident would keep elapsed≈0 forever and never restart.
     try:
         with sqlite3.connect(cooldown_db, timeout=5.0) as conn:
             row = conn.execute(
-                "SELECT last_seen, run_count FROM incidents WHERE fingerprint=?", (incident["fingerprint"],)
+                "SELECT ended_at FROM agent_runs WHERE incident_id=? AND status='restart_attempted' "
+                "ORDER BY id DESC LIMIT 1",
+                (incident["fingerprint"],),
             ).fetchone()
             if row:
-                last_seen_str, run_count = row
                 try:
-                    last_seen = _parse_ts(last_seen_str)
-                    elapsed = (datetime.now(timezone.utc) - last_seen).total_seconds()
-                    # If we just restarted recently (<cooldown) and run_count >1, skip
-                    if elapsed < RESTART_COOLDOWN_S and run_count > 1:
-                        msg = f"cooldown {RESTART_COOLDOWN_S}s, elapsed {int(elapsed)}s, run_count={run_count}"
+                    last_restart = _parse_ts(row[0])
+                    elapsed = (datetime.now(timezone.utc) - last_restart).total_seconds()
+                    if elapsed < RESTART_COOLDOWN_S:
+                        msg = f"cooldown {RESTART_COOLDOWN_S}s, last restart {int(elapsed)}s ago"
                         print(f"    [auto-fix] skipped (cooldown: {msg})")
                         return {"action": "skipped", "reason": f"cooldown: {msg}"}
                 except (ValueError, sqlite3.Error) as e:
                     logger.debug("cooldown check failed: %s", e)
     except (sqlite3.Error, ValueError) as e:
         logger.debug("cooldown DB access failed: %s", e)
+
+    # Record the restart attempt BEFORE spawning (storm guard for concurrent runs)
+    now_ts = now_iso()
+    try:
+        with sqlite3.connect(cooldown_db, timeout=5.0) as conn:
+            conn.execute(
+                "INSERT INTO agent_runs (incident_id, started_at, ended_at, status, actions_json) "
+                "VALUES (?, ?, ?, 'restart_attempted', ?)",
+                (incident["fingerprint"], now_ts, now_ts, json.dumps({"bat": target_bat})),
+            )
+            conn.commit()
+    except sqlite3.Error as e:
+        logger.debug("restart attempt bookkeeping failed: %s", e)
 
     print("    [auto-fix] RESTARTING server...")
     print(f"    [auto-fix] bat: {target_bat}")
