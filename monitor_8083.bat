@@ -1,12 +1,14 @@
 @echo off
-title Superlog-lite: monitoring ik_llama:8083 (auto-fix)
+title Superlog-lite: monitoring LLM ports 8083->8080 (failover, auto-fix)
 setlocal
+if not defined SUPERLOG_PORTS set "SUPERLOG_PORTS=8083,8080"
 
 echo ============================================================
-echo  SUPERLOG-LITE: monitoring ik_llama:8083
+echo  SUPERLOG-LITE: monitoring local LLM servers
+echo  Ports (failover order): %SUPERLOG_PORTS%
 echo  %~dp0monitor.py
-echo  - checks /v1/models + trial generation
-echo  - incidents stored in SQLite (incidents.db)
+echo  - first reachable port is monitored, rest are fallbacks
+echo  - per-port incident logs: incidents.db / incidents_8080.db
 echo  - auto-fix: server restart on crash (cooldown 600s)
 echo ============================================================
 
