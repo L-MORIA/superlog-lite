@@ -83,10 +83,30 @@ RESTART_COOLDOWN_S = int(os.getenv("SUPERLOG_RESTART_COOLDOWN", "600"))
 GEN_TIMEOUT = float(os.getenv("SUPERLOG_GEN_TIMEOUT", "120"))
 DB_PATH = Path(__file__).parent / "incidents.db"
 
-# Restart bat — env overrides, fallback to sibling dir (F:/barozp-opus-8083) for backward compat
+# Multi-port failover: priority order, first reachable port is monitored;
+# remaining ports are fallbacks checked when higher-priority ones are down.
+DEFAULT_PORTS = [int(p.strip()) for p in os.getenv("SUPERLOG_PORTS", "8083,8080").split(",") if p.strip()]
+
+# Restart bat per port — env overrides, fallback to sibling dirs for backward compat.
+# NOTE: these bats kill "competitor" llama-servers on sibling ports before starting,
+# so auto-fixing a down primary while a fallback is serving would kill the fallback.
 _default_restart = str(Path(__file__).parent.parent / "barozp-opus-8083" / "run_barozp_8083_mtp.bat")
-RESTART_BAT = os.getenv("SUPERLOG_RESTART_BAT", _default_restart)
+_default_restart_8080 = str(Path(__file__).parent.parent / "ik_llama.cpp" / "run_ik_qwen38.bat")
+PORT_RESTART_BATS = {
+    8083: os.getenv("SUPERLOG_RESTART_BAT", _default_restart),
+    8080: os.getenv("SUPERLOG_RESTART_BAT_8080", _default_restart_8080),
+}
+RESTART_BAT = PORT_RESTART_BATS.get(8083, _default_restart)
 RESTART_CWD = os.getenv("SUPERLOG_RESTART_CWD", str(Path(RESTART_BAT).parent) if RESTART_BAT else "")
+
+
+def db_for_port(port: int, primary_port: int, db_override=None) -> Path:
+    """Per-port incident DB. Primary keeps legacy incidents.db; others get incidents_<port>.db."""
+    if db_override:
+        return Path(db_override)
+    if port == primary_port:
+        return DB_PATH
+    return DB_PATH.parent / f"incidents_{port}.db"
 
 # Generation test defaults
 DEFAULT_MAX_TOKENS = 100
@@ -104,12 +124,16 @@ def _normalize_frame(text: str) -> str:
     return normalized[:200]
 
 
-def api(path, body=None, timeout=120):
-    """Make API call to local LLM server. Returns dict; on error {"error":..., "status":...}."""
+def api(path, body=None, timeout=120, base=None):
+    """Make API call to local LLM server. Returns dict; on error {"error":..., "status":...}.
+
+    base overrides the module-level BASE (multi-port monitoring).
+    """
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body else None
-    # BASE is a local-LLM endpoint (http://localhost:port) configured at startup;
+    # Endpoint is a local-LLM endpoint (http://localhost:port) configured at startup;
     # not user-supplied input, so file:// risk does not apply. S310 silenced.
-    url = path if path.startswith("http") else BASE + path
+    b = base if base is not None else BASE
+    url = path if path.startswith("http") else b + path
     req = urllib.request.Request(  # noqa: S310
         url,
         data=data,
@@ -157,12 +181,12 @@ def init_db(db_path=None):
         conn.commit()
 
 
-def measure_tok_s(max_tokens=100, timeout=None):
+def measure_tok_s(max_tokens=100, timeout=None, base=None):
     """Measure tokens/second with a real generation test (dynamic model)."""
     # Try to discover model from /v1/models
     model = DEFAULT_MODEL_FALLBACK
     try:
-        models_resp = api("/models", timeout=10)
+        models_resp = api("/models", timeout=10, base=base)
         if "error" not in models_resp:
             data = models_resp.get("data", [])
             if data and isinstance(data, list) and "id" in data[0]:
@@ -184,6 +208,7 @@ def measure_tok_s(max_tokens=100, timeout=None):
             "temperature": 0.3,
         },
         timeout=req_timeout,
+        base=base,
     )
     t1 = time.time()
 
@@ -228,21 +253,21 @@ def measure_tok_s(max_tokens=100, timeout=None):
     return result
 
 
-def _server_root() -> str:
-    """Server root URL: strip a trailing /v1 from BASE (health lives above it)."""
-    base = BASE.rstrip("/")
-    return base[:-3] if base.endswith("/v1") else base
+def _server_root(base=None) -> str:
+    """Server root URL: strip a trailing /v1 from base (health lives above it)."""
+    b = (base if base is not None else BASE).rstrip("/")
+    return b[:-3] if b.endswith("/v1") else b
 
 
-def check_server():
-    """Full health check: /models + generation test."""
+def check_server(base=None):
+    """Full health check: /models + generation test (against given base)."""
     result = {
         "timestamp": now_iso(),
         "checks": {},
     }
 
     # Check 1: /v1/models reachable (api never throws, no try needed)
-    models = api("/models", timeout=10)
+    models = api("/models", timeout=10, base=base)
     result["checks"]["models"] = {
         "ok": "error" not in models,
         "count": len(models.get("data", [])) if "error" not in models else 0,
@@ -268,7 +293,7 @@ def check_server():
     # --parallel 1 a busy slot makes the generation probe block up to
     # GEN_TIMEOUT and get misclassified as a critical generation_error —
     # detect server_busy instead and skip the probe.
-    health = api(_server_root() + "/health", timeout=5)
+    health = api(_server_root(base) + "/health", timeout=5, base=base)
     if "error" in health:
         slot = {"ok": True, "status": "unknown", "note": health["error"]}
     elif health.get("status", "ok") == "ok":
@@ -284,7 +309,7 @@ def check_server():
 
     # Check 2: Generation test (skipped when the slot is busy)
     if slot["ok"]:
-        result["checks"]["generation"] = measure_tok_s(DEFAULT_MAX_TOKENS)
+        result["checks"]["generation"] = measure_tok_s(DEFAULT_MAX_TOKENS, base=base)
     else:
         result["checks"]["generation"] = {
             "tok_s": 0,
@@ -419,16 +444,22 @@ def store_incident(incident, db_path=None):
     }
 
 
-def auto_fix(incident):
-    """Restart the LLM server on critical incidents (with cooldown)."""
+def auto_fix(incident, port=None, db_path=None):
+    """Restart the LLM server on critical incidents (with cooldown).
+
+    port selects the per-port restart bat; db_path selects the cooldown DB.
+    """
     # Only auto-fix critical incidents (not warnings like low_throughput)
     if incident["severity"] != "critical":
         print(f"    [auto-fix] skipped (severity={incident['severity']})")
         return {"action": "skipped", "reason": f"severity={incident['severity']}"}
 
+    target_bat = PORT_RESTART_BATS.get(port or 8083, RESTART_BAT)
+    cooldown_db = db_path or DB_PATH
+
     # Cooldown: avoid restart storm — check last_seen for this fingerprint
     try:
-        with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
+        with sqlite3.connect(cooldown_db, timeout=5.0) as conn:
             row = conn.execute(
                 "SELECT last_seen, run_count FROM incidents WHERE fingerprint=?", (incident["fingerprint"],)
             ).fetchone()
@@ -448,32 +479,32 @@ def auto_fix(incident):
         logger.debug("cooldown DB access failed: %s", e)
 
     print("    [auto-fix] RESTARTING server...")
-    print(f"    [auto-fix] bat: {RESTART_BAT}")
+    print(f"    [auto-fix] bat: {target_bat}")
 
-    if not Path(RESTART_BAT).exists():
-        return {"action": "failed", "error": f"restart bat not found: {RESTART_BAT}"}
+    if not Path(target_bat).exists():
+        return {"action": "failed", "error": f"restart bat not found: {target_bat}"}
 
-    if not Path(RESTART_CWD).exists():
-        return {"action": "failed", "error": f"restart cwd not found: {RESTART_CWD}"}
+    restart_cwd = str(Path(target_bat).parent)
 
     try:
         # Use cmd /c for reliable .bat execution on Windows.
         # `cmd` is a hardcoded Windows shell binary (always in PATH), not
         # user-supplied input. S603/S607 do not apply.
         proc = subprocess.Popen(  # noqa: S603
-            [r"C:\Windows\System32\cmd.exe", "/c", RESTART_BAT],
+            [r"C:\Windows\System32\cmd.exe", "/c", target_bat],
             creationflags=_CREATE_NEW_CONSOLE,
-            cwd=RESTART_CWD,
+            cwd=restart_cwd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         print(f"    [auto-fix] PID={proc.pid}")
 
         # Wait for server to come back (up to 120s) — check /models (not /health)
+        restart_base = f"http://localhost:{port or 8083}/v1"
         print("    [auto-fix] waiting for server to come back...")
         for i in range(24):  # 24 x 5s = 120s max
             time.sleep(5)
-            health = api("/models", timeout=5)
+            health = api("/models", timeout=5, base=restart_base)
             if "error" not in health:
                 print(f"    [auto-fix] server back up after {(i+1)*5}s")
                 return {"action": "restarted", "pid": proc.pid, "waited_s": (i + 1) * 5}
@@ -488,11 +519,51 @@ def auto_fix(incident):
         }
 
 
+def _print_checks(tag, checks):
+    print(f"\nTimestamp: {checks['timestamp']}  [{tag}]")
+    print("CHECKS:")
+    print(f"  models: {checks['checks']['models']}")
+    if "slot" in checks["checks"]:
+        print(f"  slot: {checks['checks']['slot']}")
+    gen = checks["checks"]["generation"]
+    if gen.get("skipped"):
+        print(f"  generation: SKIPPED ({gen['skipped']})")
+    else:
+        print(
+            f"  generation: tok_s={gen.get('tok_s', 0):.1f}, latency={gen.get('latency_s', 0):.2f}s, "
+            f"tokens={gen.get('completion_tokens', 0)}"
+        )
+
+
+def _show_memory(db_file):
+    """Print incident memory summary for one per-port DB."""
+    try:
+        with sqlite3.connect(db_file, timeout=5.0) as conn:
+            rows = conn.execute(
+                "SELECT fingerprint, error_type, run_count, first_seen, last_seen FROM incidents"
+            ).fetchall()
+            if rows:
+                print(f"\nINCIDENT MEMORY ({db_file.name}) — {len(rows)} total:")
+                for r in rows:
+                    print(f"  {r[0]}  {r[1]:<20} runs={r[2]}  first={r[3][:19]}  last={r[4][:19]}")
+    except sqlite3.Error as e:
+        print(f"\n[warn] cannot read incident memory ({db_file.name}): {e}")
+
+
 def main():
     # CLI entry point: CLI flags override module-level defaults. Global mutation
     # here is intentional and the only mutation point for these constants.
     global DB_PATH, TOK_S_THRESHOLD, LATENCY_THRESHOLD, GEN_TIMEOUT  # noqa: PLW0603
-    parser = argparse.ArgumentParser(description="Superlog-lite: monitor ik_llama:8083")
+    parser = argparse.ArgumentParser(
+        description="Superlog-lite: monitor local LLM servers (multi-port failover)"
+    )
+    parser.add_argument(
+        "--ports",
+        type=str,
+        default=",".join(str(p) for p in DEFAULT_PORTS),
+        help=f"priority-ordered ports (default: {','.join(str(p) for p in DEFAULT_PORTS)}). "
+        "First reachable port is monitored; the rest are failover targets.",
+    )
     parser.add_argument("--no-auto-fix", action="store_true", help="disable auto-restart on critical incidents")
     parser.add_argument("--db", type=str, default=None, help=f"path to incidents.db (default: {DB_PATH})")
     parser.add_argument("--threshold-tok", type=float, default=None, help=f"tok/s threshold (default {TOK_S_THRESHOLD})")
@@ -508,68 +579,125 @@ def main():
     if args.gen_timeout is not None:
         GEN_TIMEOUT = args.gen_timeout
 
+    ports = [int(p.strip()) for p in args.ports.split(",") if p.strip().isdigit()]
+    if not ports:
+        ports = list(DEFAULT_PORTS)
+    primary_port = ports[0]
+    db_override = str(DB_PATH) if args.db else None
+
     init_db()
 
     print("=" * 60)
-    print("SUPERLOG-LITE: ik_llama:8083 Monitoring Demo")
+    print(f"SUPERLOG-LITE: monitoring ports {' -> '.join(str(p) for p in ports)} (failover order)")
     print("=" * 60)
 
-    # Run health check
-    checks = check_server()
+    # --- Failover scan: first reachable port becomes the monitored one ---
+    active_port = None
+    checks_by_port = {}
+    for port in ports:
+        base = f"http://localhost:{port}/v1"
+        checks_by_port[port] = check_server(base=base)
+        if checks_by_port[port]["checks"]["models"]["ok"]:
+            active_port = port
+            break
 
-    print(f"\nTimestamp: {checks['timestamp']}")
-    print("\nCHECKS:")
-    print(f"  models: {checks['checks']['models']}")
-    if "slot" in checks["checks"]:
-        print(f"  slot: {checks['checks']['slot']}")
-    gen = checks["checks"]["generation"]
-    if gen.get("skipped"):
-        print(f"  generation: SKIPPED ({gen['skipped']})")
+    if active_port is not None:
+        idx = ports.index(active_port)
+        down_ports = ports[:idx]
+        tag = f":{active_port}"
+        if down_ports:
+            tag += f" — FAILOVER ({' '.join(':' + str(p) + ' down' for p in down_ports)})"
+        checks = checks_by_port[active_port]
+        _print_checks(tag, checks)
+
+        # Log unreachable incidents for every DOWN higher-priority port
+        # into ITS OWN per-port DB ("отдельный лог по этому порту").
+        for dp in down_ports:
+            dp_db = Path(db_for_port(dp, primary_port, db_override=db_override))
+            init_db(dp_db)
+            dp_err = checks_by_port[dp]["checks"]["models"].get("error", "unknown")
+            dp_inc = {
+                "fingerprint": fingerprint("server_unreachable", f"port_{dp}_{dp_err}"),
+                "error_type": "server_unreachable",
+                "severity": "critical",
+                "message": f":{dp} unreachable (failover active on :{active_port})",
+            }
+            r = store_incident(dp_inc, db_path=dp_db)
+            print(f"\n  • :{dp} server_unreachable [critical] -> logged to {dp_db.name}")
+            print(f"    recurrence: {r['is_recurrence']}, run_count: {r['run_count']}")
+
+        # Classify incidents against the ACTIVE server only
+        incidents = classify_incident(checks)
+        db_file = Path(db_for_port(active_port, primary_port, db_override=db_override))
+        if incidents:
+            init_db(db_file)
+
+        if not incidents:
+            gen = checks["checks"]["generation"]
+            print("\nNO INCIDENTS — server healthy")
+            if not gen.get("skipped"):
+                print(f"   tok/s: {gen.get('tok_s', 0):.1f} (threshold: {TOK_S_THRESHOLD})")
+                print(f"   latency: {gen.get('latency_s', 0):.2f}s (threshold: {LATENCY_THRESHOLD}s)")
+        else:
+            print(f"\n{len(incidents)} INCIDENT(S) DETECTED on :{active_port}:")
+            for inc in incidents:
+                print(f"\n  • {inc['error_type']} [{inc['severity']}]")
+                print(f"    fingerprint: {inc['fingerprint']}")
+                print(f"    message: {inc['message']}")
+
+                # Store in per-port memory
+                result = store_incident(inc, db_path=db_file)
+                print(f"    recurrence: {result['is_recurrence']}, run_count: {result['run_count']}")
+                if result["prior_findings"]:
+                    print(f"    prior_findings: {result['prior_findings'][:200]}...")
+
+                # Auto-fix on critical — restarts THIS port's server
+                if inc["severity"] == "critical" and not args.no_auto_fix:
+                    fix = auto_fix(inc, port=active_port, db_path=db_file)
+                    print(f"    auto_fix: {fix}")
+                elif args.no_auto_fix and inc["severity"] == "critical":
+                    print("    auto_fix: skipped (--no-auto-fix)")
     else:
-        print(
-            f"  generation: tok_s={gen.get('tok_s', 0):.1f}, latency={gen.get('latency_s', 0):.2f}s, "
-            f"tokens={gen.get('completion_tokens', 0)}"
-        )
+        # --- All ports down: single critical incident, restart the PRIMARY ---
+        print("\nALL PORTS DOWN:")
+        for port in ports:
+            err = checks_by_port[port]["checks"]["models"].get("error", "unknown")
+            print(f"  :{port} -> {err[:100]}")
 
-    # Classify incidents
-    incidents = classify_incident(checks)
+        err = checks_by_port[primary_port]["checks"]["models"].get("error", "all_ports_down")
+        inc = {
+            "fingerprint": fingerprint("server_unreachable", err),
+            "error_type": "server_unreachable",
+            "severity": "critical",
+            "message": f"All monitored ports down: {ports}",
+        }
+        print("\n  • all_ports_down [critical]")
+        print(f"    fingerprint: {inc['fingerprint']}")
 
-    if not incidents:
-        print("\nNO INCIDENTS — server healthy")
-        print(f"   tok/s: {gen['tok_s']:.1f} (threshold: {TOK_S_THRESHOLD})")
-        print(f"   latency: {gen['latency_s']:.2f}s (threshold: {LATENCY_THRESHOLD}s)")
-    else:
-        print(f"\n{len(incidents)} INCIDENT(S) DETECTED:")
-        for inc in incidents:
-            print(f"\n  • {inc['error_type']} [{inc['severity']}]")
-            print(f"    fingerprint: {inc['fingerprint']}")
-            print(f"    message: {inc['message']}")
+        db_file = Path(db_for_port(primary_port, primary_port, db_override=db_override))
+        init_db(db_file)
+        result = store_incident(inc, db_path=db_file)
+        print(f"    recurrence: {result['is_recurrence']}, run_count: {result['run_count']}")
 
-            # Store in memory
-            result = store_incident(inc)
-            print(f"    recurrence: {result['is_recurrence']}, run_count: {result['run_count']}")
-            if result["prior_findings"]:
-                print(f"    prior_findings: {result['prior_findings'][:200]}...")
+        # Restart ONLY the primary bat. The bats kill sibling llama-servers
+        # before starting, so restarting a fallback here would be destructive;
+        # bringing the primary back also restores the normal priority order.
+        # WARNING for the user: with a fallback still serving, the restart bat
+        # will KILL it (competitor-kill) before starting the primary.
+        if not args.no_auto_fix:
+            print("    [auto-fix] restarting PRIMARY server")
+            if len(ports) > 1:
+                print("    [auto-fix] NOTE: primary's bat kills sibling llama-servers on other ports first")
+            fix = auto_fix(inc, port=primary_port, db_path=db_file)
+            print(f"    auto_fix: {fix}")
+        else:
+            print("    auto_fix: skipped (--no-auto-fix)")
 
-            # Auto-fix on critical
-            if inc["severity"] == "critical" and not args.no_auto_fix:
-                fix = auto_fix(inc)
-                print(f"    auto_fix: {fix}")
-            elif args.no_auto_fix and inc["severity"] == "critical":
-                print("    auto_fix: skipped (--no-auto-fix)")
-
-    # Show incident memory
-    try:
-        with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
-            rows = conn.execute(
-                "SELECT fingerprint, error_type, run_count, first_seen, last_seen FROM incidents"
-            ).fetchall()
-            if rows:
-                print(f"\nINCIDENT MEMORY ({len(rows)} total):")
-                for r in rows:
-                    print(f"  {r[0]}  {r[1]:<20} runs={r[2]}  first={r[3][:19]}  last={r[4][:19]}")
-    except sqlite3.Error as e:
-        print(f"\n[warn] cannot read incident memory: {e}")
+    # --- Incident memory across all port DBs ---
+    for port in ports:
+        db_file = Path(db_for_port(port, primary_port, db_override=db_override))
+        if db_file.exists():
+            _show_memory(db_file)
 
     print("\n" + "=" * 60)
 

@@ -136,7 +136,7 @@ def test_check_server_skips_all_probes_when_models_fail():
     probe may run — no GEN_TIMEOUT wait, no duplicate incidents."""
     calls = []
 
-    def side_effect(path, body=None, timeout=120):
+    def side_effect(path, body=None, timeout=120, base=None):
         calls.append(path)
         return {"error": "[Errno 10061] connection refused"}
 
@@ -184,7 +184,7 @@ def test_check_server_skips_probe_when_slot_busy():
     """When /health says no slot available, the generation probe must not run."""
     calls = []
 
-    def side_effect(path, body=None, timeout=120):
+    def side_effect(path, body=None, timeout=120, base=None):
         calls.append(path)
         if path.endswith("/models"):
             return {"data": [{"id": "m"}]}
@@ -201,7 +201,7 @@ def test_check_server_skips_probe_when_slot_busy():
 
 
 def test_check_server_slot_ok_runs_probe():
-    def side_effect(path, body=None, timeout=120):
+    def side_effect(path, body=None, timeout=120, base=None):
         if path.endswith("/models"):
             return {"data": [{"id": "m"}]}
         if path.endswith("/health"):
@@ -217,7 +217,7 @@ def test_check_server_slot_ok_runs_probe():
 def test_measure_gen_timeout_passthrough():
     captured = {}
 
-    def side_effect(path, body=None, timeout=120):
+    def side_effect(path, body=None, timeout=120, base=None):
         captured[path] = timeout
         if path == "/models":
             return {"data": [{"id": "m"}]}
@@ -304,7 +304,7 @@ def test_init_db_wal(tmp_path):
 def test_measure_no_usage_returns_error():
     mock_resp = {"choices": [], "usage": {}}
     with patch.object(monitor, "api") as mock_api:
-        def side_effect(path, body=None, timeout=10):
+        def side_effect(path, body=None, timeout=10, base=None):
             if path == "/models":
                 return {"data": [{"id": "test-model"}]}
             if path == "/chat/completions":
@@ -323,7 +323,7 @@ def test_measure_with_text_fallback():
     }
     with patch.object(monitor, "api") as mock_api:
         with patch.object(monitor.time, "time", side_effect=[1000.0, 1002.0]):
-            mock_api.side_effect = lambda path, body=None, timeout=10: {"data": [{"id": "m"}]} if path == "/models" else mock_resp
+            mock_api.side_effect = lambda path, body=None, timeout=10, base=None: {"data": [{"id": "m"}]} if path == "/models" else mock_resp
             result = monitor.measure_tok_s(100)
         assert result.get("completion_tokens", 0) > 0, f"should estimate tokens: {result}"
         assert result["tok_s"] > 0
@@ -355,7 +355,7 @@ def test_api_success():
 def test_check_server_no_dead_try():
     """C-10: check_server should not have dead try/except."""
     with patch.object(monitor, "api") as mock_api:
-        mock_api.side_effect = lambda path, body=None, timeout=10: {"data": [{"id": "x"}]}
+        mock_api.side_effect = lambda path, body=None, timeout=10, base=None: {"data": [{"id": "x"}]}
         result = monitor.check_server()
         assert "checks" in result
         assert "models" in result["checks"]
@@ -460,3 +460,60 @@ def test_ruff_clean():
         import pytest
         pytest.skip("ruff not installed")
     assert result.returncode == 0, f"ruff failed:\n{result.stdout}\n{result.stderr}"
+
+
+# --- Multi-port failover tests ---
+
+def test_db_for_port_primary_and_fallback():
+    """Primary port keeps legacy incidents.db; fallback gets incidents_<port>.db."""
+    assert monitor.db_for_port(8083, 8083) == monitor.DB_PATH
+    assert monitor.db_for_port(8080, 8083) == monitor.DB_PATH.parent / "incidents_8080.db"
+    # explicit override wins
+    assert monitor.db_for_port(8080, 8083, db_override="x.db") == Path("x.db")
+
+
+def test_api_base_param_overrides_base():
+    """api(base=...) must target the given server, not module BASE."""
+    captured = {}
+
+    class FakeResp:
+        def read(self):
+            return b'{"data": []}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return FakeResp()
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        monitor.api("/models", timeout=5, base="http://localhost:8080/v1")
+    assert captured["url"].startswith("http://localhost:8080/v1"), captured["url"]
+
+
+def test_check_server_passes_base():
+    """check_server(base=...) probes the given base (models + health)."""
+    seen = []
+
+    def side_effect(path, body=None, timeout=120, base=None):
+        seen.append((path, base))
+        if path.endswith("/models"):
+            return {"data": [{"id": "m"}]}
+        if path.endswith("/health"):
+            return {"status": "ok"}
+        return {"choices": [{"message": {"content": "x" * 40}}], "usage": {"completion_tokens": 10}}
+
+    with patch.object(monitor, "api", side_effect=side_effect):
+        result = monitor.check_server(base="http://localhost:8080/v1")
+    assert result["checks"]["models"]["ok"] is True
+    assert any(b == "http://localhost:8080/v1" for _, b in seen)
+
+
+def test_port_restart_bats_has_both_ports():
+    """Per-port restart bats configured for both monitored ports."""
+    assert 8083 in monitor.PORT_RESTART_BATS
+    assert 8080 in monitor.PORT_RESTART_BATS
